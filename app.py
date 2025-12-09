@@ -1,4 +1,4 @@
-# app.py - IoT ML Realtime Dashboard
+# app.py - IgniteLogic IoT ML Dashboard (MQTT Stabil)
 
 import streamlit as st
 import pandas as pd
@@ -12,32 +12,37 @@ import plotly.graph_objs as go
 import paho.mqtt.client as mqtt
 import joblib
 
-# --------------------------------
-# CONFIGURATIONS
-# --------------------------------
+
+# -------------------------------------------------
+# CONFIG
+# -------------------------------------------------
 MQTT_BROKER = "broker.emqx.io"
 MQTT_PORT = 1883
 TOPIC_SENSOR = "Iot/IgniteLogic/sensor"
 TOPIC_OUTPUT = "Iot/IgniteLogic/output"
 MODEL_PATH = "model.pkl"
 
-# timezone
 TZ = timezone(timedelta(hours=7))
 def now_str():
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
-# Queue global untuk message
+
+# -------------------------------------------------
+# GLOBAL QUEUE (untuk MQTT thread)
+# -------------------------------------------------
 GLOBAL_MQ = queue.Queue()
 
-# --------------------------------
-# STREAMLIT BASE CONFIG
-# --------------------------------
-st.set_page_config(page_title="IgniteLogic Dashboard", layout="wide")
-st.title("🔥 IgniteLogic IoT + Machine Learning Dashboard")
 
-# --------------------------------
-# SESSION STATE INIT
-# --------------------------------
+# -------------------------------------------------
+# STREAMLIT CONFIG
+# -------------------------------------------------
+st.set_page_config(page_title="IgniteLogic ML IoT Dashboard", layout="wide")
+st.title("🔥 IgniteLogic IoT + Machine Learning Dashboard (Stable Version)")
+
+
+# -------------------------------------------------
+# SESSION STATE
+# -------------------------------------------------
 if "logs" not in st.session_state:
     st.session_state.logs = []
 
@@ -52,25 +57,36 @@ if "mqtt_client" not in st.session_state:
 
 # Load ML model
 if "ml_model" not in st.session_state:
-    st.session_state.ml_model = joblib.load(MODEL_PATH)
+    try:
+        st.session_state.ml_model = joblib.load(MODEL_PATH)
+        st.success(f"Model loaded: {MODEL_PATH}")
+    except:
+        st.session_state.ml_model = None
+        st.error("Model gagal dimuat! Pastikan model.pkl ada di root folder.")
 
-# --------------------------------
+
+# -------------------------------------------------
 # MQTT CALLBACKS
-# --------------------------------
+# -------------------------------------------------
 def _on_connect(client, userdata, flags, rc):
-    client.subscribe(TOPIC_SENSOR)
-    GLOBAL_MQ.put({"_type": "status", "connected": (rc == 0)})
+    if rc == 0:
+        client.subscribe(TOPIC_SENSOR)
+        GLOBAL_MQ.put({"_type": "status", "msg": "Connected"})
+    else:
+        GLOBAL_MQ.put({"_type": "status", "msg": "Failed"})
+
 
 def _on_message(client, userdata, msg):
     try:
-        payload = json.loads(msg.payload.decode())
-        GLOBAL_MQ.put({"_type": "sensor", "data": payload})
+        data = json.loads(msg.payload.decode())
+        GLOBAL_MQ.put({"_type": "sensor", "data": data})
     except:
-        pass
+        GLOBAL_MQ.put({"_type": "raw", "payload": msg.payload.decode()})
 
-# --------------------------------
-# MQTT THREAD — FIXED VERSION
-# --------------------------------
+
+# -------------------------------------------------
+# MQTT THREAD — SUPER STABIL
+# -------------------------------------------------
 def start_mqtt_thread_once():
 
     def worker():
@@ -78,29 +94,32 @@ def start_mqtt_thread_once():
         client.on_connect = _on_connect
         client.on_message = _on_message
 
-        st.session_state.mqtt_client = client
-
-        # Connect once - loop_start handles async receiving
         while True:
             try:
                 client.connect(MQTT_BROKER, MQTT_PORT, 60)
-                client.loop_start()     # NON BLOCKING!
-                break
+                st.session_state.mqtt_client = client
+                client.loop_forever()  # ← Kunci stabilitas Streamlit Cloud
             except Exception as e:
                 GLOBAL_MQ.put({"_type": "error", "msg": str(e)})
-                time.sleep(2)
+                time.sleep(3)
 
     if not st.session_state.mqtt_thread_started:
-        threading.Thread(target=worker, daemon=True).start()
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
         st.session_state.mqtt_thread_started = True
+
 
 start_mqtt_thread_once()
 
-# --------------------------------
-# ML Prediction Wrapper
-# --------------------------------
+
+# -------------------------------------------------
+# ML PREDICT
+# -------------------------------------------------
 def predict_status(light, temp, hum):
     model = st.session_state.ml_model
+    if model is None:
+        return "ERR", None
+
     X = [[light, temp, hum]]
 
     try:
@@ -108,24 +127,20 @@ def predict_status(light, temp, hum):
     except:
         label = "ERR"
 
-    if hasattr(model, "predict_proba"):
-        try:
-            conf = float(np.max(model.predict_proba(X)))
-        except:
-            conf = None
-    else:
+    try:
+        conf = float(np.max(model.predict_proba(X)))
+    except:
         conf = None
 
     return label, conf
 
-# --------------------------------
-# PROCESS MQTT QUEUE
-# --------------------------------
-def process_queue():
-    q = GLOBAL_MQ
 
-    while not q.empty():
-        item = q.get()
+# -------------------------------------------------
+# PROCESS INCOMING MQTT
+# -------------------------------------------------
+def process_queue():
+    while not GLOBAL_MQ.empty():
+        item = GLOBAL_MQ.get()
         t = now_str()
 
         if item["_type"] == "sensor":
@@ -135,18 +150,17 @@ def process_queue():
             temp = float(d.get("temperature", 0))
             hum = float(d.get("humidity", 0))
 
-            # Predict ML
             pred, conf = predict_status(light, temp, hum)
 
-            # Publish output ke ESP32, pakai client utama
-            out_msg = "AMAN" if pred == "Aman" else "TIDAK_AMAN"
+            # publish hasil ke ESP32
             try:
-                if st.session_state.mqtt_client is not None:
-                    st.session_state.mqtt_client.publish(TOPIC_OUTPUT, out_msg)
+                client = st.session_state.mqtt_client
+                if client is not None:
+                    msg = "AMAN" if pred == "Aman" else "TIDAK_AMAN"
+                    client.publish(TOPIC_OUTPUT, msg)
             except:
                 pass
 
-            # Simpan log
             row = {
                 "ts": t,
                 "light": light,
@@ -159,42 +173,46 @@ def process_queue():
             st.session_state.last = row
             st.session_state.logs.append(row)
 
-            # Limit log biar tidak berat
+            # limit log
             if len(st.session_state.logs) > 2000:
                 st.session_state.logs = st.session_state.logs[-2000:]
 
+
+# jalankan sebelum render UI
 process_queue()
 
-# --------------------------------
-# UI
-# --------------------------------
+
+# -------------------------------------------------
+# UI LAYOUT
+# -------------------------------------------------
 left, right = st.columns([1, 2])
 
-# LEFT PANEL
+# LEFT SIDE
 with left:
-    st.header("📡 Last Sensor Reading")
+    st.header("📡 Sensor Terakhir")
 
     if st.session_state.last:
         last = st.session_state.last
 
-        st.write(f"⏱ Time: {last['ts']}")
+        st.write(f"⏱ Waktu: {last['ts']}")
         st.write(f"💡 Light: {last['light']}")
-        st.write(f"🌡 Temperature: {last['temp']} °C")
-        st.write(f"💧 Humidity: {last['hum']} %")
+        st.write(f"🌡 Temp: {last['temp']} °C")
+        st.write(f"💧 Hum: {last['hum']} %")
 
         st.markdown("---")
-        st.subheader("ML Prediction")
+
+        st.subheader("🤖 ML Prediction")
 
         if last["pred"] == "Aman":
-            st.success(f"🟢 Status: {last['pred']}")
+            st.success("🟢 Aman")
         else:
-            st.error(f"🔴 Status: {last['pred']}")
+            st.error("🔴 Tidak Aman")
 
         st.write(f"Confidence: {last['conf']}")
     else:
         st.info("Menunggu data dari ESP32...")
 
-# RIGHT PANEL
+# RIGHT SIDE
 with right:
     st.header("📊 Live Chart")
 
@@ -202,13 +220,9 @@ with right:
 
     if not df.empty:
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=df["ts"], y=df["temp"],
-                         mode="lines", name="Temp"))
-        fig.add_trace(go.Scatter(x=df["ts"], y=df["hum"],
-                         mode="lines", name="Humidity"))
-        fig.add_trace(go.Scatter(x=df["ts"], y=df["light"],
-                         mode="lines", name="Light"))
-
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["temp"], mode="lines", name="Temp"))
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["hum"], mode="lines", name="Humidity"))
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["light"], mode="lines", name="Light"))
         st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Recent Logs")
