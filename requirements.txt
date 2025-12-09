@@ -1,0 +1,8 @@
+streamlit>=1.25.0
+pandas
+numpy
+joblib
+scikit-learn
+plotly
+paho-mqtt
+streamlit-autorefresh
