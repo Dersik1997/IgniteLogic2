@@ -23,8 +23,8 @@ except Exception:
 MQTT_BROKER = "broker.emqx.io"
 MQTT_PORT = 1883
 TOPIC_SENSOR = "Iot/IgniteLogic/sensor"
-TOPIC_OUTPUT = "Iot/IgniteLogic/output" # Digunakan untuk mengirim perintah LED balik
-MODEL_PATH = "model.pkl" 
+TOPIC_OUTPUT = "Iot/IgniteLogic/output" # Digunakan untuk mengirim perintah LED balik ke ESP32
+MODEL_PATH = "model.pkl" # Pastikan file model scikit-learn ada di folder yang sama
 
 # timezone GMT+7 helper
 TZ = timezone(timedelta(hours=7))
@@ -77,7 +77,6 @@ if "ml_model" not in st.session_state:
 def _on_connect(client, userdata, flags, rc):
     try:
         client.subscribe(TOPIC_SENSOR)
-        # Tidak perlu subscribe TOPIC_OUTPUT karena Streamlit yang mengirim ke topik itu
     except Exception:
         pass
     GLOBAL_MQ.put({"_type": "status", "connected": (rc == 0), "ts": time.time()})
@@ -85,14 +84,12 @@ def _on_connect(client, userdata, flags, rc):
 def _on_message(client, userdata, msg):
     payload = msg.payload.decode(errors="ignore")
     
-    # Semua pesan dari ESP32 (topik sensor) adalah data
     try:
         data = json.loads(payload)
     except Exception:
         GLOBAL_MQ.put({"_type": "raw", "payload": payload, "ts": time.time()})
         return
 
-    # push structured sensor message
     GLOBAL_MQ.put({"_type": "sensor", "data": data, "ts": time.time(), "topic": msg.topic})
 
 # ---------------------------
@@ -100,7 +97,6 @@ def _on_message(client, userdata, msg):
 # ---------------------------
 def start_mqtt_thread_once():
     def worker():
-        # Gunakan klien unik untuk thread worker
         client = mqtt.Client() 
         client.on_connect = _on_connect
         client.on_message = _on_message
@@ -125,7 +121,7 @@ start_mqtt_thread_once()
 def get_status_color(status):
     if "Aman" in status:
         return "green"
-    elif "Waspada" in status or "Cek" in status:
+    elif "Waspada" in status or "Kuning" in status:
         return "orange"
     elif "Tidak Aman" in status or "Merah" in status:
         return "red"
@@ -154,12 +150,13 @@ def process_queue():
         elif ttype == "sensor":
             d = item.get("data", {})
             
+            # Ambil data dari ESP32
             suhu = float(d.get("suhu", np.nan))
             lembap = float(d.get("lembap", np.nan))
-            light = int(d.get("light", np.nan)) # Asumsi model dilatih dengan nilai LDR yang DIBALIK (light = 4095 - rawLight)
+            light = int(d.get("light", np.nan)) # Nilai dibalik (4095=Terang)
             rawLight = int(d.get("rawLight", np.nan)) # Nilai mentah (0=Terang)
             
-            # Label dari ESP32 hanya sebagai penanda (N/A)
+            # Label dari ESP32 hanya sebagai penanda
             status_esp = d.get("label", "N/A") 
             
             row = {
@@ -169,7 +166,8 @@ def process_queue():
                 "light": light,
                 "rawLight": rawLight,
                 "status_esp": status_esp, 
-                "prediksi_server": "Menunggu Prediksi"
+                "prediksi_server": "Menunggu Prediksi",
+                "perintah_terkirim": "N/A"
             }
             
             # =========================================================
@@ -178,10 +176,10 @@ def process_queue():
             prediksi_server = "N/A"
             if st.session_state.ml_model and not np.isnan([suhu, lembap, light]).any():
                 try:
-                    # Input Model: [suhu, lembap, light (dibalik)]
-                    fitur_input = np.array([[suhu, lembap, light]])
+                    # Input Model: [[suhu, lembap, light (dibalik)]]. PENTING: Gunakan np.float64
+                    fitur_input = np.array([[np.float64(suhu), np.float64(lembap), np.float64(light)]]) 
                     
-                    # Prediksi (Hasilnya harus berupa string 'Aman', 'Waspada', 'Tidak Aman')
+                    # Prediksi
                     prediksi_server = st.session_state.ml_model.predict(fitur_input)[0]
                     
                     # -----------------------------------------------------------------
@@ -196,6 +194,7 @@ def process_queue():
                         perintah_led = "LED_MERAH"
                         
                     try:
+                        # Klien publish harus dibuat di Streamlit thread
                         pubc = mqtt.Client()
                         pubc.connect(MQTT_BROKER, MQTT_PORT, 60)
                         pubc.publish(TOPIC_OUTPUT, perintah_led) 
@@ -203,7 +202,6 @@ def process_queue():
                         row["perintah_terkirim"] = perintah_led
                     except Exception as e:
                         row["perintah_terkirim"] = f"ERROR PUBLISH: {e}" 
-                    # -----------------------------------------------------------------
 
                 except Exception as e:
                     prediksi_server = f"Prediksi Error: {e}"
@@ -226,7 +224,7 @@ def process_queue():
 _ = process_queue()
 
 # ---------------------------
-# UI layout (Disesuaikan untuk Prediksi Server)
+# UI layout
 # ---------------------------
 if HAS_AUTOREFRESH:
     st_autorefresh(interval=2000, limit=None, key="autorefresh") 
@@ -259,12 +257,18 @@ with left:
         
         st.caption(f"Perintah Terakhir ke ESP32: **{last.get('perintah_terkirim', 'N/A')}**")
 
-
     else:
         st.info("Waiting for data...")
 
     st.markdown("---")
-    # Bagian Manual Control bisa dihilangkan atau diubah untuk mengirim perintah LED langsung
+    st.header("Download Logs")
+    if st.button("Download CSV"):
+        if st.session_state.logs:
+            df_dl = pd.DataFrame(st.session_state.logs)
+            csv = df_dl.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV file", data=csv, file_name=f"iot_logs_{int(time.time())}.csv")
+        else:
+            st.info("No logs to download")
 
 with right:
     st.header("Live Chart (last 200 points)")
@@ -305,9 +309,10 @@ with right:
     st.markdown("### Recent Logs")
     if st.session_state.logs:
         # Menampilkan kolom prediksi_server
-        df_display = pd.DataFrame(st.session_state.logs)[["ts", "suhu", "lembap", "light", "rawLight", "prediksi_server", "status_esp"]].rename(columns={
-            "status_esp": "Label Awal (N/A)",
-            "prediksi_server": "Prediksi Server (ML)"
+        df_display = pd.DataFrame(st.session_state.logs)[["ts", "suhu", "lembap", "light", "prediksi_server", "perintah_terkirim"]].rename(columns={
+            "light": "Light (Dibalik)",
+            "prediksi_server": "Prediksi Server (ML)",
+            "perintah_terkirim": "Perintah Ke ESP32"
         })
         st.dataframe(df_display[::-1].head(100), use_container_width=True)
     else:
