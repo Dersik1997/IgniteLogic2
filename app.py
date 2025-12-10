@@ -40,8 +40,8 @@ GLOBAL_MQ = queue.Queue()
 # Streamlit page setup
 # ---------------------------
 
-st.set_page_config(page_title="IoT Realtime Dashboard (Aman/Tidak Aman)", layout="wide")
-st.title("💡 Dashboard Monitoring Lingkungan Realtime (ESP32)")
+st.set_page_config(page_title="IoT Realtime Dashboard (Aman/Waspada/Tidak Aman)", layout="wide")
+st.title("💡 Dashboard Monitoring Lingkungan Realtime (ESP32) - Tiga Label")
 
 # ---------------------------
 # session_state init
@@ -58,7 +58,6 @@ if "last" not in st.session_state:
 if "mqtt_thread_started" not in st.session_state:
     st.session_state.mqtt_thread_started = False
 
-# Kunci ML model dihapus karena logika sudah di ESP32
 if "ml_model" in st.session_state:
     del st.session_state["ml_model"]
     
@@ -68,7 +67,6 @@ if "ml_model" in st.session_state:
 def _on_connect(client, userdata, flags, rc):
     try:
         client.subscribe(TOPIC_SENSOR)
-        # Tambahkan subscribe ke TOPIC_OUTPUT jika ingin melihat feedback balik
         client.subscribe(TOPIC_OUTPUT) 
     except Exception:
         pass
@@ -77,7 +75,7 @@ def _on_connect(client, userdata, flags, rc):
 def _on_message(client, userdata, msg):
     payload = msg.payload.decode(errors="ignore")
     
-    # Pesan dari TOPIC_OUTPUT (misal: status Aman/Tidak Aman)
+    # Pesan dari TOPIC_OUTPUT (misal: label Aman/Waspada/Tidak Aman)
     if msg.topic == TOPIC_OUTPUT:
         GLOBAL_MQ.put({"_type": "output", "payload": payload, "ts": time.time()})
         return
@@ -134,42 +132,42 @@ def process_queue():
             st.error(item.get("msg"))
             updated = True
         
-        # Penanganan pesan OUTPUT dari ESP32 (biasanya status Aman/Tidak Aman)
         elif ttype == "output":
-            # Ini bisa dicatat atau diabaikan, tapi untuk saat ini, kita abaikan saja karena data sensor sudah mencakup status.
-            pass
+            pass # diabaikan karena status diambil dari data 'sensor'
 
         elif ttype == "sensor":
             d = item.get("data", {})
             
-            # --- PENTING: Penyesuaian Kunci JSON ---
+            # --- PENTING: Mengubah kunci JSON dari "status" ke "label" ---
             try:
-                suhu = float(d.get("suhu")) # Mengambil "suhu" dari Arduino
+                suhu = float(d.get("suhu"))
             except Exception:
                 suhu = None
             try:
-                lembap = float(d.get("lembap")) # Mengambil "lembap" dari Arduino
+                lembap = float(d.get("lembap"))
             except Exception:
                 lembap = None
             try:
-                light = int(d.get("light")) # Mengambil "light" dari Arduino
+                light = int(d.get("light"))
             except Exception:
                 light = None
             
-            status_esp = d.get("status", "N/A") # Mengambil "status" dari Arduino
+            # >>> MENGAMBIL KUNCI "label" DARI KODE ESP32 YANG BARU <<<
+            status_esp = d.get("label", "N/A") # Mengambil "label" dari Arduino
 
             row = {
                 "ts": datetime.fromtimestamp(item.get("ts", time.time()), TZ).strftime("%Y-%m-%d %H:%M:%S"),
                 "suhu": suhu,
                 "lembap": lembap,
                 "light": light,
-                "status_esp": status_esp # Status dari logika di ESP32
+                "status_esp": status_esp # Status dari logika di ESP32 (Aman, Waspada, Tidak Aman)
             }
             
-            # --- Nonaktifkan Logika ML/Anomaly (Karena sudah ada di ESP32) ---
+            # --- Nonaktifkan Logika ML/Anomaly (Menggunakan status dari ESP32) ---
             row["pred"] = status_esp # Gunakan status ESP32 sebagai 'prediksi'
-            row["conf"] = 1.0 if status_esp in ["Aman", "Tidak Aman"] else None
-            row["anomaly"] = False
+            # Kita bisa set conf ke 1.0 untuk menunjukkan kepastian, atau None
+            row["conf"] = 1.0 
+            row["anomaly"] = ("Tidak Aman" in status_esp) # Menandai Tidak Aman sebagai anomali
             # -----------------------------------------------------------------
 
             st.session_state.last = row
@@ -180,9 +178,6 @@ def process_queue():
                 st.session_state.logs = st.session_state.logs[-5000:]
             updated = True
             
-            # Tidak perlu auto-publish alert karena logika penentuan sudah ada di ESP32
-            # Jika Anda ingin Streamlit menimpa status (misal: mengaktifkan fan override),
-            # Anda bisa menambahkan logika publish di sini.
     return updated
 
 # run once here to pick up immediately available messages
@@ -198,9 +193,20 @@ if HAS_AUTOREFRESH:
 
 left, right = st.columns([1, 2])
 
+# --- Helper function for status color ---
+def get_status_color(status):
+    if "Aman" in status:
+        return "green"
+    elif "Waspada" in status:
+        return "orange" # Kuning diwakili dengan orange di HTML/CSS dasar
+    else:
+        return "red"
+# ----------------------------------------
+
+
 with left:
     st.header("Connection Status")
-    st.write("Broker:", f"{MQTT_BROKER}:{MQTT_PORT}")
+    st.write("Broker:", f"**{MQTT_BROKER}:{MQTT_PORT}**")
     connected = getattr(st.session_state, "last_status", None)
     st.metric("MQTT Connected", "Yes" if connected else "No")
     st.write("Topic Sensor:", TOPIC_SENSOR)
@@ -216,16 +222,20 @@ with left:
         st.write(f"Lembap: **{last.get('lembap')} %**")
         st.markdown("### Status ESP32")
         
-        status_color = "green" if last.get('status_esp') == "Aman" else "red"
-        st.markdown(f"**<p style='font-size: 24px; color: {status_color};'>{last.get('status_esp', 'N/A')}</p>**", unsafe_allow_html=True)
+        # LOGIKA WARNA BARU DENGAN 3 KATEGORI
+        status_text = last.get('status_esp', 'N/A')
+        status_color = get_status_color(status_text)
+        
+        st.markdown(f"**<p style='font-size: 24px; color: {status_color};'>● {status_text}</p>**", unsafe_allow_html=True)
         
     else:
         st.info("Waiting for data...")
 
     st.markdown("---")
     st.header("Manual Output Control")
-    col1, col2 = st.columns(2)
-    # Gunakan status Aman/Tidak Aman sesuai logika ESP32
+    # Kontrol disesuaikan untuk mengirimkan label yang jelas ke TOPIC_OUTPUT
+    col1, col2, col3 = st.columns(3)
+    
     if col1.button("Send Aman"):
         try:
             pubc = mqtt.Client()
@@ -235,13 +245,24 @@ with left:
             st.success("Published Aman")
         except Exception as e:
             st.error(f"Publish failed: {e}")
-    if col2.button("Send Tidak Aman"):
+            
+    if col2.button("Send Waspada"):
         try:
             pubc = mqtt.Client()
             pubc.connect(MQTT_BROKER, MQTT_PORT, 60)
-            pubc.publish(TOPIC_OUTPUT, "Tidak Aman")
+            pubc.publish(TOPIC_OUTPUT, "Waspada (Cahaya Masuk)")
             pubc.disconnect()
-            st.success("Published Tidak Aman")
+            st.warning("Published Waspada")
+        except Exception as e:
+            st.error(f"Publish failed: {e}")
+            
+    if col3.button("Send Tidak Aman"):
+        try:
+            pubc = mqtt.Client()
+            pubc.connect(MQTT_BROKER, MQTT_PORT, 60)
+            pubc.publish(TOPIC_OUTPUT, "Tidak Aman (Suhu/Lembap Tinggi)")
+            pubc.disconnect()
+            st.error("Published Tidak Aman")
         except Exception as e:
             st.error(f"Publish failed: {e}")
 
@@ -249,7 +270,6 @@ with left:
     st.header("Download Logs")
     if st.button("Download CSV"):
         if st.session_state.logs:
-            # Sesuaikan kolom untuk log
             df_dl = pd.DataFrame(st.session_state.logs)
             csv = df_dl.to_csv(index=False).encode("utf-8")
             st.download_button("Download CSV file", data=csv, file_name=f"iot_logs_{int(time.time())}.csv")
@@ -260,7 +280,6 @@ with right:
     st.header("Live Chart (last 200 points)")
     df_plot = pd.DataFrame(st.session_state.logs[-200:])
     
-    # Kunci kolom disesuaikan menjadi "suhu" dan "lembap"
     if (not df_plot.empty) and {"suhu", "lembap", "light"}.issubset(df_plot.columns):
         fig = go.Figure()
         
@@ -270,30 +289,25 @@ with right:
         # Kelembaban
         fig.add_trace(go.Scatter(x=df_plot["ts"], y=df_plot["lembap"], mode="lines+markers", name="Lembap (%)", yaxis="y2"))
         
-        # Cahaya (Light) - sebagai Y3
+        # Cahaya (Light)
         fig.add_trace(go.Scatter(x=df_plot["ts"], y=df_plot["light"], mode="lines", name="Light (0-4095)", yaxis="y3", opacity=0.3))
 
 
         fig.update_layout(
             yaxis=dict(title="Suhu (°C)", side="left"),
             yaxis2=dict(title="Lembap (%)", overlaying="y", side="right", showgrid=False),
-            yaxis3=dict(title="Light", overlaying="y", side="right", showgrid=False, range=[0, 4100], anchor="free", position=0.98), # Tambahkan Y3
+            yaxis3=dict(title="Light", overlaying="y", side="right", showgrid=False, range=[0, 4100], anchor="free", position=0.98),
             height=520,
             hovermode="x unified"
         )
         
-        # color markers by status ESP32
+        # color markers by status ESP32 (3-way logic)
         colors = []
         for _, r in df_plot.iterrows():
             stat = r.get("status_esp", "")
-            if stat == "Aman":
-                colors.append("green")
-            elif stat == "Tidak Aman":
-                colors.append("red")
-            else:
-                colors.append("gray")
-                
-        # Terapkan pewarnaan hanya pada Suhu dan Lembap (Trace 0 dan 1)
+            colors.append(get_status_color(stat)) # Menggunakan fungsi helper
+            
+        # Terapkan pewarnaan pada Suhu dan Lembap
         fig.update_traces(marker=dict(size=8, color=colors), selector=dict(mode="lines+markers", name="Suhu (°C)"))
         fig.update_traces(marker=dict(size=8, color=colors), selector=dict(mode="lines+markers", name="Lembap (%)"))
         
@@ -313,4 +327,3 @@ with right:
 
 # after UI render, drain queue (so next rerun shows fresh data)
 process_queue()
-
