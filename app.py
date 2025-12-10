@@ -1,4 +1,4 @@
-# app.py (Disempurnakan untuk 3 Kelas: 0, 1, 2)
+# app.py (Dengan Logika Override Kritis Suhu/Lembap)
 
 import streamlit as st
 import pandas as pd
@@ -28,7 +28,7 @@ MQTT_PORT = 1883
 TOPIC_SENSOR = "Iot/IgniteLogic/sensor"
 TOPIC_OUTPUT = "Iot/IgniteLogic/output" 
 MODEL_PATH = "model.pkl"  
-CSV_LOG_PATH = "iot_sensor_data.csv" # File log otomatis
+CSV_LOG_PATH = "iot_sensor_data.csv" 
 
 # Timezone helper (WIB/WITA/WIT, di sini diatur ke UTC+7)
 TZ = timezone(timedelta(hours=7))
@@ -44,7 +44,7 @@ GLOBAL_MQ = queue.Queue()
 
 st.set_page_config(page_title="IoT Realtime Dashboard (scikit-learn + CSV Log)", layout="wide")
 st.title("💡 Dashboard Monitoring Lingkungan Realtime (Prediksi scikit-learn & CSV Log)")
-st.caption("ESP32 mengirim data mentah. Server (Streamlit) membuat prediksi ML, mengirim perintah LED balik, dan menyimpan log.")
+st.caption("ESP32 mengirim data mentah. Server (Streamlit) membuat prediksi ML/Override, mengirim perintah LED balik, dan menyimpan log.")
 
 # ---------------------------
 # session_state init
@@ -138,11 +138,13 @@ start_mqtt_thread_once()
 
 # --- Helper function for status color ---
 def get_status_color(status):
+    # Logika warna disesuaikan untuk menangani status OVERRIDE KRITIS
     if "Aman" in status or "HIJAU" in status:
         return "green"
     elif "Waspada" in status or "KUNING" in status:
         return "orange"
-    elif "Tidak Aman" in status or "MERAH" in status:
+    # Merah untuk status Tidak Aman dan Override Kritis
+    elif "Tidak Aman" in status or "MERAH" in status or "KRITIS" in status:
         return "red"
     else:
         return "gray"
@@ -189,46 +191,57 @@ def process_queue():
             }
             
             # =========================================================
-            # LOGIKA PREDIKSI SCKIT-LEARN (SERVER)
+            # LOGIKA OVERRIDE KRITIS (ATURAN BISNIS)
             # =========================================================
-            prediksi_server_label = "N/A"
-            prediksi_server_raw = "N/A"
-            perintah_led = "N/A"
+            is_critical_override = False
             
-            # Cek apakah model ada dan semua fitur input valid (bukan NaN)
-            if st.session_state.ml_model and not np.isnan([suhu, lembap, light]).any():
+            # Rule: Jika suhu > 30 DAN kelembaban >= 90, paksa MERAH/KRITIS
+            if not np.isnan([suhu, lembap]).any() and (suhu > 30.0 and lembap >= 90.0):
+                prediksi_server_label = "OVERRIDE KRITIS - MERAH"
+                perintah_led = "LED_MERAH"
+                prediksi_server_raw = "OVERRIDE"
+                is_critical_override = True
+                
+            # =========================================================
+            
+            # Jalankan Prediksi ML hanya jika tidak ada Override Kritis
+            if not is_critical_override:
+                prediksi_server_label = "N/A"
+                prediksi_server_raw = "N/A"
+                perintah_led = "N/A"
+            
+                if st.session_state.ml_model and not np.isnan([suhu, lembap, light]).any():
+                    try:
+                        # Input Model: [suhu, lembap, light]
+                        fitur_input = np.array([[np.float64(suhu), np.float64(lembap), np.float64(light)]]) 
+                        
+                        prediksi_raw = st.session_state.ml_model.predict(fitur_input)[0]
+                        prediksi_server_raw = str(prediksi_raw)
+                        
+                        # --- INTERPRETASI ML (Pemetaan 3-Kelas: 0, 1, 2) ---
+                        if prediksi_raw == 0:
+                            prediksi_server_label = "Aman (0) - HIJAU"
+                            perintah_led = "LED_HIJAU"
+                        elif prediksi_raw == 1:
+                            prediksi_server_label = "Waspada (1) - KUNING"
+                            perintah_led = "LED_KUNING"
+                        elif prediksi_raw == 2:
+                            prediksi_server_label = "Tidak Aman (2) - MERAH"
+                            perintah_led = "LED_MERAH"
+                        else:
+                             prediksi_server_label = f"UNKNOWN ({prediksi_raw})"
+                             perintah_led = "LED_MERAH" 
+
+                    except Exception as e:
+                        prediksi_server_label = f"ML Error: {e}" 
+            
+            # --- Kirim Perintah MQTT (Dilakukan hanya sekali) ---
+            if pub_client and perintah_led != "N/A":
                 try:
-                    # Input Model: [suhu, lembap, light] (Urutan harus sesuai pelatihan model)
-                    fitur_input = np.array([[np.float64(suhu), np.float64(lembap), np.float64(light)]]) 
-                    
-                    # Prediksi (Hasil prediksi adalah angka: 0, 1, 2, dll.)
-                    prediksi_raw = st.session_state.ml_model.predict(fitur_input)[0]
-                    prediksi_server_raw = str(prediksi_raw)
-                    
-                    # --- INTERPRETASI DAN KONTROL LED BALIK KE ESP32 ---
-                    
-                    # Logika pemetaan 3-Kelas: 0 = HIJAU, 1 = KUNING, 2 = MERAH
-                    if prediksi_raw == 0:
-                        prediksi_server_label = "Aman (0) - HIJAU"
-                        perintah_led = "LED_HIJAU"
-                    elif prediksi_raw == 1:
-                        prediksi_server_label = "Waspada (1) - KUNING"
-                        perintah_led = "LED_KUNING"
-                    elif prediksi_raw == 2:
-                        prediksi_server_label = "Tidak Aman (2) - MERAH"
-                        perintah_led = "LED_MERAH"
-                    else:
-                         prediksi_server_label = f"UNKNOWN ({prediksi_raw})"
-                         perintah_led = "LED_MERAH" 
-
-                    if pub_client:
-                        pub_client.publish(TOPIC_OUTPUT, perintah_led) 
-                        row["perintah_terkirim"] = perintah_led
-                    else:
-                        row["perintah_terkirim"] = "ERROR PUBLISH (Client Down)"
-
-                except Exception as e:
-                    prediksi_server_label = f"ML Error: {e}" 
+                    pub_client.publish(TOPIC_OUTPUT, perintah_led) 
+                    row["perintah_terkirim"] = perintah_led
+                except Exception:
+                    row["perintah_terkirim"] = "ERROR PUBLISH"
             
             row["prediksi_server"] = prediksi_server_label
             row["prediksi_server_raw"] = prediksi_server_raw 
@@ -242,27 +255,23 @@ def process_queue():
             updated = True
             
     # =========================================================
-    # LOGIKA OTOMATIS MENULIS KE CSV (Setelah data diproses)
+    # LOGIKA CSV LOGGING
     # =========================================================
     if updated and st.session_state.logs:
         try:
             df_log = pd.DataFrame(st.session_state.logs)
-            
             df_export = df_log[['ts', 'suhu', 'lembap', 'light', 'rawLight', 'prediksi_server']].copy()
             df_export.to_csv(CSV_LOG_PATH, index=False)
-            
         except Exception:
-            pass # Gagal menulis ke disk
+            pass
             
-    # =========================================================
-    
     return updated
 
 # run once here to pick up immediately available messages
 _ = process_queue()
 
 # ---------------------------
-# UI layout
+# UI layout (Sudah Sesuai)
 # ---------------------------
 if HAS_AUTOREFRESH:
     st_autorefresh(interval=2000, limit=None, key="autorefresh") 
@@ -292,7 +301,13 @@ with left:
         st.markdown("### Prediksi Server (scikit-learn)")
         pred_text = last.get('prediksi_server', 'N/A')
         pred_color = get_status_color(pred_text)
-        st.markdown(f"**<p style='font-size: 24px; color: {pred_color};'>● {pred_text}</p>**", unsafe_allow_html=True)
+        
+        # Penanganan display untuk Override Kritis
+        display_text = pred_text
+        if "OVERRIDE KRITIS" in pred_text:
+            display_text = f"🚨 {pred_text} 🚨"
+            
+        st.markdown(f"**<p style='font-size: 24px; color: {pred_color};'>{display_text}</p>**", unsafe_allow_html=True)
         
         st.caption(f"Prediksi Mentah (Raw Output): **{last.get('prediksi_server_raw', 'N/A')}**")
         st.caption(f"Perintah Terakhir ke ESP32: **{last.get('perintah_terkirim', 'N/A')}**")
@@ -349,7 +364,6 @@ with right:
 
     st.markdown("### Recent Logs")
     if st.session_state.logs:
-        # Tambahkan prediksi_server_raw ke tampilan log jika ada
         log_columns = ["ts", "suhu", "lembap", "light", "prediksi_server", "perintah_terkirim"]
         if 'prediksi_server_raw' in st.session_state.logs[0]:
              log_columns.insert(5, "prediksi_server_raw")
