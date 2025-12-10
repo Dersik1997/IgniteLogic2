@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib # Digunakan untuk memuat model scikit-learn
+import joblib 
 import json
 import time
 import queue
@@ -23,8 +23,8 @@ except Exception:
 MQTT_BROKER = "broker.emqx.io"
 MQTT_PORT = 1883
 TOPIC_SENSOR = "Iot/IgniteLogic/sensor"
-TOPIC_OUTPUT = "Iot/IgniteLogic/output" 
-MODEL_PATH = "model.pkl" # Pastikan file model scikit-learn ada di folder yang sama
+TOPIC_OUTPUT = "Iot/IgniteLogic/output" # Digunakan untuk mengirim perintah LED balik
+MODEL_PATH = "model.pkl" 
 
 # timezone GMT+7 helper
 TZ = timezone(timedelta(hours=7))
@@ -40,8 +40,9 @@ GLOBAL_MQ = queue.Queue()
 # Streamlit page setup
 # ---------------------------
 
-st.set_page_config(page_title="IoT Realtime Dashboard (ML Server)", layout="wide")
+st.set_page_config(page_title="IoT Realtime Dashboard (scikit-learn)", layout="wide")
 st.title("💡 Dashboard Monitoring Lingkungan Realtime (Prediksi scikit-learn)")
+st.caption("ESP32 mengirim data mentah. Server (Streamlit) membuat prediksi ML dan mengirim perintah LED balik.")
 
 # ---------------------------
 # session_state init
@@ -50,7 +51,6 @@ if "msg_queue" not in st.session_state:
     st.session_state.msg_queue = GLOBAL_MQ
 
 if "logs" not in st.session_state:
-    # Menambahkan kolom 'prediksi_server' ke logs
     st.session_state.logs = [] 
 
 if "last" not in st.session_state:
@@ -62,7 +62,6 @@ if "mqtt_thread_started" not in st.session_state:
 # Inisialisasi/Muat Model scikit-learn
 if "ml_model" not in st.session_state:
     try:
-        # Coba muat model yang sudah dilatih (pkl file)
         st.session_state.ml_model = joblib.load(MODEL_PATH)
         st.info(f"Model scikit-learn ({MODEL_PATH}) berhasil dimuat.")
     except FileNotFoundError:
@@ -73,13 +72,12 @@ if "ml_model" not in st.session_state:
         st.error(f"Error memuat model ML: {e}")
 
 # ---------------------------
-# MQTT callbacks (use GLOBAL_MQ, NOT st.session_state inside callbacks)
-# (Tidak diubah dari kode Anda sebelumnya)
+# MQTT callbacks
 # ---------------------------
 def _on_connect(client, userdata, flags, rc):
     try:
         client.subscribe(TOPIC_SENSOR)
-        client.subscribe(TOPIC_OUTPUT) 
+        # Tidak perlu subscribe TOPIC_OUTPUT karena Streamlit yang mengirim ke topik itu
     except Exception:
         pass
     GLOBAL_MQ.put({"_type": "status", "connected": (rc == 0), "ts": time.time()})
@@ -87,10 +85,7 @@ def _on_connect(client, userdata, flags, rc):
 def _on_message(client, userdata, msg):
     payload = msg.payload.decode(errors="ignore")
     
-    if msg.topic == TOPIC_OUTPUT:
-        GLOBAL_MQ.put({"_type": "output", "payload": payload, "ts": time.time()})
-        return
-
+    # Semua pesan dari ESP32 (topik sensor) adalah data
     try:
         data = json.loads(payload)
     except Exception:
@@ -101,11 +96,12 @@ def _on_message(client, userdata, msg):
     GLOBAL_MQ.put({"_type": "sensor", "data": data, "ts": time.time(), "topic": msg.topic})
 
 # ---------------------------
-# Start MQTT thread (worker) (Tidak diubah)
+# Start MQTT thread (worker)
 # ---------------------------
 def start_mqtt_thread_once():
     def worker():
-        client = mqtt.Client()
+        # Gunakan klien unik untuk thread worker
+        client = mqtt.Client() 
         client.on_connect = _on_connect
         client.on_message = _on_message
         while True:
@@ -131,13 +127,14 @@ def get_status_color(status):
         return "green"
     elif "Waspada" in status or "Cek" in status:
         return "orange"
-    else:
+    elif "Tidak Aman" in status or "Merah" in status:
         return "red"
+    else:
+        return "gray"
 # ----------------------------------------
 
-
 # ---------------------------
-# Drain queue (process incoming msgs) - LOGIKA PREDIKSI BARU DI SINI
+# Drain queue (process incoming msgs) - LOGIKA PREDIKSI & KONTROL DI SINI
 # ---------------------------
 def process_queue():
     updated = False
@@ -154,29 +151,15 @@ def process_queue():
             st.error(item.get("msg"))
             updated = True
         
-        elif ttype == "output":
-            pass
-
         elif ttype == "sensor":
             d = item.get("data", {})
             
-            try:
-                suhu = float(d.get("suhu"))
-            except Exception:
-                suhu = None
-            try:
-                lembap = float(d.get("lembap"))
-            except Exception:
-                lembap = None
-            try:
-                # Menggunakan light (yang sudah dibalik) jika model ML dilatih dengan nilai terbalik
-                # Jika model ML dilatih dengan rawLight, gunakan nilai mentah.
-                # Kita akan asumsikan model ML dilatih dengan 3 fitur: suhu, lembap, light (terbalik)
-                light = int(d.get("light")) 
-            except Exception:
-                light = None
+            suhu = float(d.get("suhu", np.nan))
+            lembap = float(d.get("lembap", np.nan))
+            light = int(d.get("light", np.nan)) # Asumsi model dilatih dengan nilai LDR yang DIBALIK (light = 4095 - rawLight)
+            rawLight = int(d.get("rawLight", np.nan)) # Nilai mentah (0=Terang)
             
-            # Mendapatkan label dari ESP32
+            # Label dari ESP32 hanya sebagai penanda (N/A)
             status_esp = d.get("label", "N/A") 
             
             row = {
@@ -184,36 +167,55 @@ def process_queue():
                 "suhu": suhu,
                 "lembap": lembap,
                 "light": light,
+                "rawLight": rawLight,
                 "status_esp": status_esp, 
-                "prediksi_server": "N/A" # Default
+                "prediksi_server": "Menunggu Prediksi"
             }
             
             # =========================================================
             # START: LOGIKA PREDIKSI SCKIT-LEARN (SERVER)
             # =========================================================
-            if st.session_state.ml_model and suhu is not None and lembap is not None and light is not None:
+            prediksi_server = "N/A"
+            if st.session_state.ml_model and not np.isnan([suhu, lembap, light]).any():
                 try:
-                    # Model scikit-learn memerlukan input fitur dalam bentuk array 2D
-                    # PENTING: Urutan fitur (suhu, lembap, light) HARUS sama dengan urutan saat model dilatih
+                    # Input Model: [suhu, lembap, light (dibalik)]
                     fitur_input = np.array([[suhu, lembap, light]])
                     
-                    # Lakukan prediksi (Klasifikasi atau Regresi)
+                    # Prediksi (Hasilnya harus berupa string 'Aman', 'Waspada', 'Tidak Aman')
                     prediksi_server = st.session_state.ml_model.predict(fitur_input)[0]
                     
-                    # Tambahkan hasil prediksi server ke baris data
-                    row["prediksi_server"] = str(prediksi_server)
-                    
+                    # -----------------------------------------------------------------
+                    # KIRIM PERINTAH KONTROL BALIK KE ESP32 MELALUI MQTT
+                    # -----------------------------------------------------------------
+                    perintah_led = ""
+                    if "Aman" in prediksi_server:
+                        perintah_led = "LED_HIJAU"
+                    elif "Waspada" in prediksi_server:
+                        perintah_led = "LED_KUNING"
+                    else: # Tidak Aman atau label lainnya
+                        perintah_led = "LED_MERAH"
+                        
+                    try:
+                        pubc = mqtt.Client()
+                        pubc.connect(MQTT_BROKER, MQTT_PORT, 60)
+                        pubc.publish(TOPIC_OUTPUT, perintah_led) 
+                        pubc.disconnect()
+                        row["perintah_terkirim"] = perintah_led
+                    except Exception as e:
+                        row["perintah_terkirim"] = f"ERROR PUBLISH: {e}" 
+                    # -----------------------------------------------------------------
+
                 except Exception as e:
-                    row["prediksi_server"] = "Prediksi Error"
-                    # st.error(f"Error prediksi scikit-learn: {e}") # Nonaktifkan agar UI tidak terlalu ramai
+                    prediksi_server = f"Prediksi Error: {e}"
+            
+            row["prediksi_server"] = str(prediksi_server)
             # =========================================================
-            # END: LOGIKA PREDIKSI SCKIT-LEARN
+            # END: LOGIKA PREDIKSI SCKIT-LEARN (SERVER)
             # =========================================================
 
             st.session_state.last = row
             st.session_state.logs.append(row)
             
-            # keep bounded
             if len(st.session_state.logs) > 5000:
                 st.session_state.logs = st.session_state.logs[-5000:]
             updated = True
@@ -224,7 +226,7 @@ def process_queue():
 _ = process_queue()
 
 # ---------------------------
-# UI layout
+# UI layout (Disesuaikan untuk Prediksi Server)
 # ---------------------------
 if HAS_AUTOREFRESH:
     st_autorefresh(interval=2000, limit=None, key="autorefresh") 
@@ -233,64 +235,50 @@ left, right = st.columns([1, 2])
 
 with left:
     st.header("Connection Status")
-    # ... (Bagian Connection Status tidak diubah)
     st.write("Broker:", f"**{MQTT_BROKER}:{MQTT_PORT}**")
     connected = getattr(st.session_state, "last_status", None)
     st.metric("MQTT Connected", "Yes" if connected else "No")
-    st.write("Topic Sensor:", TOPIC_SENSOR)
-    st.write("Topic Output:", TOPIC_OUTPUT)
+    st.write("Topic Sensor (Input):", TOPIC_SENSOR)
+    st.write("Topic Output (Control):", TOPIC_OUTPUT)
     st.markdown("---")
 
     st.header("Last Reading")
     if st.session_state.last:
         last = st.session_state.last
         st.write(f"Time: **{last.get('ts')}**")
-        st.write(f"Light: **{last.get('light')}** (0-4095)")
         st.write(f"Suhu: **{last.get('suhu')} °C**")
         st.write(f"Lembap: **{last.get('lembap')} %**")
+        st.write(f"Light (Dibalik): **{last.get('light')}**")
+        st.write(f"RAW Light: **{last.get('rawLight')}**")
         st.markdown("---")
 
-        st.markdown("### Status ESP32 (Edge)")
-        status_text = last.get('status_esp', 'N/A')
-        status_color = get_status_color(status_text)
-        st.markdown(f"**<p style='font-size: 24px; color: {status_color};'>● {status_text}</p>**", unsafe_allow_html=True)
-        
         st.markdown("### Prediksi Server (scikit-learn)")
         pred_text = last.get('prediksi_server', 'N/A')
         pred_color = get_status_color(pred_text)
         st.markdown(f"**<p style='font-size: 24px; color: {pred_color};'>● {pred_text}</p>**", unsafe_allow_html=True)
+        
+        st.caption(f"Perintah Terakhir ke ESP32: **{last.get('perintah_terkirim', 'N/A')}**")
+
 
     else:
         st.info("Waiting for data...")
 
     st.markdown("---")
-    # ... (Bagian Manual Output Control dan Download Logs tidak diubah, namun disingkat di sini)
-    
-    st.header("Download Logs")
-    if st.button("Download CSV"):
-        if st.session_state.logs:
-            df_dl = pd.DataFrame(st.session_state.logs)
-            csv = df_dl.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV file", data=csv, file_name=f"iot_logs_{int(time.time())}.csv")
-        else:
-            st.info("No logs to download")
+    # Bagian Manual Control bisa dihilangkan atau diubah untuk mengirim perintah LED langsung
 
 with right:
     st.header("Live Chart (last 200 points)")
-    # ... (Bagian Live Chart tidak diubah, namun disingkat di sini)
     df_plot = pd.DataFrame(st.session_state.logs[-200:])
     
     if (not df_plot.empty) and {"suhu", "lembap", "light"}.issubset(df_plot.columns):
-        # ... (Logika Plotly Chart sama)
         fig = go.Figure()
         
-        # Suhu
+        # Suhu dan Kelembaban (Primary & Secondary Axis)
         fig.add_trace(go.Scatter(x=df_plot["ts"], y=df_plot["suhu"], mode="lines+markers", name="Suhu (°C)"))
-        # Kelembaban
         fig.add_trace(go.Scatter(x=df_plot["ts"], y=df_plot["lembap"], mode="lines+markers", name="Lembap (%)", yaxis="y2"))
+        
         # Cahaya (Light)
         fig.add_trace(go.Scatter(x=df_plot["ts"], y=df_plot["light"], mode="lines", name="Light (0-4095)", yaxis="y3", opacity=0.3))
-
 
         fig.update_layout(
             yaxis=dict(title="Suhu (°C)", side="left"),
@@ -300,10 +288,10 @@ with right:
             hovermode="x unified"
         )
         
-        # color markers by status ESP32 (menggunakan Status Edge)
+        # Pewarnaan marker chart berdasarkan Prediksi Server
         colors = []
         for _, r in df_plot.iterrows():
-            stat = r.get("status_esp", "")
+            stat = r.get("prediksi_server", "")
             colors.append(get_status_color(stat))
             
         fig.update_traces(marker=dict(size=8, color=colors), selector=dict(mode="lines+markers", name="Suhu (°C)"))
@@ -317,13 +305,12 @@ with right:
     st.markdown("### Recent Logs")
     if st.session_state.logs:
         # Menampilkan kolom prediksi_server
-        df_display = pd.DataFrame(st.session_state.logs)[["ts", "light", "suhu", "lembap", "status_esp", "prediksi_server"]].rename(columns={
-            "status_esp": "Status ESP32 (Edge)",
+        df_display = pd.DataFrame(st.session_state.logs)[["ts", "suhu", "lembap", "light", "rawLight", "prediksi_server", "status_esp"]].rename(columns={
+            "status_esp": "Label Awal (N/A)",
             "prediksi_server": "Prediksi Server (ML)"
         })
         st.dataframe(df_display[::-1].head(100), use_container_width=True)
     else:
         st.write("—")
 
-# after UI render, drain queue (so next rerun shows fresh data)
 process_queue()
